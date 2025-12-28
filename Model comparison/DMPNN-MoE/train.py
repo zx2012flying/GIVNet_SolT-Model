@@ -1,0 +1,172 @@
+from tqdm import tqdm
+import torch
+import numpy as np
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+from torch.cuda.amp import autocast
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+import seaborn as sns
+import os
+import pandas as pd
+import random
+from dmpnn import dmpnn
+import math
+import time
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+
+loss_fn = torch.nn.SmoothL1Loss()
+mae_loss_fn = torch.nn.L1Loss()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def plot_best_fold_results(y_true, y_pred, r2, rmse, mae,n):
+
+    y_true = np.array(y_true).flatten()
+    y_pred = np.array(y_pred).flatten()
+
+    fig, ax_main = plt.subplots(figsize=(10, 8))
+
+    min_val, max_val = min(y_true), max(y_true)
+    offset = 0.5
+    ideal_line = [min_val, max_val]
+    upper_bound = [x + offset for x in ideal_line]
+    lower_bound = [x - offset for x in ideal_line]
+
+    ax_main.plot(ideal_line, ideal_line, color='red', linestyle='--', label='Ideal Line')
+    ax_main.fill_between(ideal_line, lower_bound, upper_bound, color='#DD706E', alpha=0.1)
+
+    within_bounds = ((y_pred <= (y_true + offset)) & (y_pred >= (y_true - offset)))
+    within_bounds_ratio = sum(within_bounds) / len(y_true)*100
+
+    scatter = ax_main.scatter(y_true, y_pred, alpha=0.3, label=f'R²: {r2:.4f}\nRMSE: {rmse:.4f}\nMAE: {mae:.4f}\n% ±0.5: {within_bounds_ratio:.2f}')
+
+    ax_main.set_xlabel('Exp. LogS')
+    ax_main.set_ylabel('CIGIN LogS')
+    ax_main.legend(loc='best')
+    ax_main.grid(True)
+
+    ax_hist_x = inset_axes(ax_main, width="100%", height="25%", loc='upper center',
+                           bbox_to_anchor=(0, 0.25, 1, 1), bbox_transform=ax_main.transAxes, borderpad=0)
+
+    ax_hist_y = inset_axes(ax_main, width="25%", height="100%", loc='center right',
+                           bbox_to_anchor=(0.25, 0, 1, 1), bbox_transform=ax_main.transAxes, borderpad=0)
+
+    bins = 30
+    sns.histplot(y_true, bins=bins, kde=False, stat="density", color='#3A93C2', alpha=0.5, ax=ax_hist_x)
+    sns.kdeplot(y_true, color='blue', alpha=0.7, ax=ax_hist_x)
+    ax_hist_x.axis('off')
+
+    sns.histplot(y=y_pred, bins=bins, kde=False, stat="density", color='#3A93C2', alpha=0.5, ax=ax_hist_y,
+                 orientation='horizontal')
+    sns.kdeplot(y=y_pred, color='blue', alpha=0.7, ax=ax_hist_y)
+    ax_hist_y.axis('off')
+
+    ax_hist_x.tick_params(axis="x", labelbottom=False)
+    ax_hist_y.tick_params(axis="y", labelleft=False)
+
+    ax_hist_x.set_xlim(ax_main.get_xlim())
+    ax_hist_y.set_ylim(ax_main.get_ylim())
+
+    save_path = os.path.join(os.getcwd(), f'pred_vs_actual_{n}.png')
+    plt.savefig(save_path, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+
+def get_metrics(model, data_loader):
+    valid_outputs = []
+    valid_labels = []
+    valid_loss = []
+    valid_mae_loss = []
+
+    tq_loader = tqdm(data_loader)
+    with torch.no_grad():
+        for samples in tq_loader:
+            pos = model(samples[0].to(device),samples[1].to(device),samples[2].to(device))
+
+            loss = loss_fn(pos, samples[3].to(device).float())
+            mae_loss = mae_loss_fn(pos, torch.tensor(samples[3]).to(device).float())
+
+            valid_outputs.extend(pos.cpu().detach().numpy().flatten().tolist())
+
+            valid_loss.append(loss.cpu().detach().numpy())
+            valid_mae_loss.append(mae_loss.cpu().detach().numpy())
+            valid_labels.extend(np.array(samples[3]).flatten().tolist())
+
+        loss = np.mean(np.hstack(valid_loss))
+        mae_loss = np.mean(np.hstack(valid_mae_loss))
+    return loss, mae_loss, np.array(valid_labels), np.array(valid_outputs)
+
+#
+def train(max_epochs, train_loader, valid_loader, project_name, n):
+    model = dmpnn(
+        node_feat_dim=111,
+        edge_feat_dim=13,
+        edge_output_dim=400,
+        node_output_dim=400,
+        extra_dim=30,
+        num_rounds1=4,
+        num_rounds2=4,
+        dropout_rate=0.05,
+        activation_type1="leakyrelu",
+        activation_type2="leakyrelu",
+        num_experts=4,
+        moe_hid_dim=400,).to(device)
+
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0)
+    scheduler = ReduceLROnPlateau(optimizer, patience=5, mode='min')
+
+    best_val_loss = 10000000
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    start_time = time.time()
+    for epoch in range(max_epochs):
+        model.train()
+        epoch_start_time = time.time()
+        running_loss = []
+        tq_loader = tqdm(train_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
+
+
+        for samples in tq_loader:
+            optimizer.zero_grad()
+            pos = model(samples[0].to(device),samples[1].to(device),samples[2].to(device))
+            loss = loss_fn(pos, samples[3].to(device).float())
+            total_loss = loss
+            total_loss.backward()
+            optimizer.step()
+            running_loss.append(total_loss.cpu().detach())
+            current_time = time.time() - start_time
+            tq_loader.set_postfix({
+                "total_loss": f"{total_loss.item():.4f}",
+                "Train Time": f"{time.time() - epoch_start_time:.1f}s",
+                "Total Time": f"{current_time:.1f}s"
+            })
+
+        model.eval()
+
+        val_loss, mae_loss, y_true, y_pred = get_metrics(model, valid_loader)
+        scheduler.step(val_loss)
+
+        print("Epoch: " + str(epoch + 1) + "  train_loss " + str(np.mean(np.array(running_loss))) + " Val_loss " + str(
+            val_loss) + " MAE Val_loss " + str(mae_loss))
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), "./runs/run-" + str(project_name) + f"/models/best_model_{n}.tar")
+
+            r2 = r2_score(y_true, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+            mae = mean_absolute_error(y_true, y_pred)
+            plot_best_fold_results(y_true, y_pred, r2, rmse, mae ,n)
+
+            y_true = np.array(y_true).flatten()
+            y_pred = np.array(y_pred).flatten()
+
+            data = {
+                'LogS' :y_true,
+                'LogS_pred': y_pred
+            }
+            df = pd.DataFrame(data)
+            df.to_csv(f'result_file_{n}.csv', index=False)
